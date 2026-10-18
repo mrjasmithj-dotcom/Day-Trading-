@@ -1,141 +1,102 @@
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
-import pandas as pd
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title="Day Trading", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Day Trading", layout="wide")
 
-# Dark theme styling
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; color: #fafafa; }
-    .stMetric { background-color: #1a1f2e; padding: 10px; border-radius: 8px; }
-    div[data-testid="stVerticalBlock"] > div { background-color: #161b22; padding: 12px; border-radius: 8px; margin-bottom: 8px; }
-    h1, h2, h3 { color: #ffffff; }
-    .stCaption { color: #8b949e; }
+    .stApp { background-color: #0f172a; color: #e2e8f0; }
+    h1, h2, h3 { color: #f8fafc !important; }
+    .stCaption { color: #94a3b8; }
 </style>
 """, unsafe_allow_html=True)
 
 PT = pytz.timezone("America/Vancouver")
-
-def now_pt():
-    return datetime.now(PT)
-
 st.title("Day Trading")
-st.caption(f"Pacific Time  ·  Multi-bot scanner  ·  {now_pt().strftime('%H:%M %Z')}")
-
-st.info("Educational prototype. Free Yahoo data can lag. Not financial advice. Leveraged products reset daily.")
+st.caption(f"Pacific Time · {datetime.now(PT).strftime('%H:%M %Z')}")
 
 CANDIDATES = ["CRWV", "NBIS", "IREN", "SMCI", "AMD", "NVDA", "TSLA", "AAPL", "MSFT", "META", "SPY", "QQQ", "SMH"]
 
-@st.cache_data(ttl=45)
-def get_data(ticker):
+@st.cache_data(ttl=90)
+def get_full(ticker):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1d", interval="5m", prepost=True)
+        t = yf.Ticker(ticker)
+        hist = t.history(period="5d", interval="5m", prepost=True)
         if hist.empty:
             return None
         hist["vwap"] = (hist["Volume"] * (hist["High"] + hist["Low"] + hist["Close"]) / 3).cumsum() / hist["Volume"].cumsum()
         price = round(float(hist["Close"].iloc[-1]), 2)
         vwap = round(float(hist["vwap"].iloc[-1]), 2)
-        avg_vol = stock.info.get("averageVolume") or hist["Volume"].sum()
-        rvol = round(hist["Volume"].sum() / avg_vol, 1) if avg_vol else 1.0
-        news = stock.news or []
-        return {"hist": hist, "price": price, "vwap": vwap, "rvol": rvol, "news": news[:3]}
+        news = t.news or []
+        return {"ticker": ticker, "hist": hist.tail(60), "price": price, "vwap": vwap, "news": news[:3]}
     except:
         return None
 
-def evaluate(ticker):
-    d = get_data(ticker)
-    if not d:
-        return None
-    price, vwap, rvol = d["price"], d["vwap"], d["rvol"]
+def classify(d):
+    if not d: return None
+    pct = (d["price"] - d["vwap"]) / d["vwap"] * 100
     news_score = min(10, 5 + len(d["news"]))
-    if price < vwap and rvol > 1.3:
-        bias = "Short"
-        conviction = min(10, int(6 + rvol))
-        reason = f"Below VWAP · elevated volume ({rvol}x)"
-    elif price > vwap and rvol > 1.3:
-        bias = "Rise"
-        conviction = min(10, int(6 + rvol))
-        reason = f"Above VWAP · elevated volume ({rvol}x)"
+    if pct < -0.4:
+        bias, conv = "Short", min(10, 6 + int(abs(pct)))
+        reason = f"{pct:.1f}% below VWAP"
+    elif pct > 0.4:
+        bias, conv = "Rise", min(10, 6 + int(pct))
+        reason = f"{pct:.1f}% above VWAP"
     else:
-        bias = "Neutral"
-        conviction = 5
-        reason = "Near VWAP or low volume"
-    return {**d, "ticker": ticker, "bias": bias, "news_score": news_score, "conviction": conviction, "reason": reason}
+        bias, conv = "Neutral", 5
+        reason = "Near VWAP"
+    return {**d, "bias": bias, "conviction": conv, "news_score": news_score, "reason": reason}
 
-# Search
-col_search, _ = st.columns([1, 3])
-with col_search:
-    search = st.text_input("Search ticker", placeholder="e.g. CRWV").upper()
-    if st.button("Scan", use_container_width=True) and search:
-        st.session_state["selected"] = search
+def render_chart(d):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=d["hist"].index, open=d["hist"].Open, high=d["hist"].High,
+        low=d["hist"].Low, close=d["hist"].Close,
+        increasing_line_color="#22c55e", decreasing_line_color="#ef4444"
+    ))
+    fig.add_trace(go.Scatter(x=d["hist"].index, y=d["hist"].vwap, mode="lines",
+                             name="VWAP", line=dict(color="#f59e0b", width=2)))
+    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis_rangeslider_visible=False, showlegend=False,
+                      paper_bgcolor="#0f172a", plot_bgcolor="#1e293b")
+    return fig
 
-with st.spinner("Updating lists..."):
-    evaluated = [evaluate(t) for t in CANDIDATES]
-    evaluated = [e for e in evaluated if e]
+with st.spinner("Loading..."):
+    data = [classify(get_full(t)) for t in CANDIDATES]
+    data = [x for x in data if x]
 
-shorts = sorted([e for e in evaluated if e["bias"] == "Short"], key=lambda x: x["conviction"], reverse=True)[:5]
-rises = sorted([e for e in evaluated if e["bias"] == "Rise"], key=lambda x: x["conviction"], reverse=True)[:5]
+shorts = sorted([x for x in data if x["bias"] == "Short"], key=lambda x: x["conviction"], reverse=True)[:4]
+rises = sorted([x for x in data if x["bias"] == "Rise"], key=lambda x: x["conviction"], reverse=True)[:4]
+if len(shorts) < 3:
+    shorts = sorted(data, key=lambda x: x["price"] - x["vwap"])[:4]
+if len(rises) < 3:
+    rises = sorted(data, key=lambda x: x["vwap"] - x["price"])[:4]
 
-left, right = st.columns(2)
+col1, col2 = st.columns(2)
 
-with left:
+with col1:
     st.subheader("Top Shorts")
-    for e in shorts or []:
-        with st.container(border=True):
-            st.markdown(f"**{e['ticker']}**  ${e['price']}   News {e['news_score']}/10   **Conviction {e['conviction']}/10**")
-            st.caption(e["reason"])
-            if st.button("Open", key=f"s{e['ticker']}", use_container_width=True):
-                st.session_state["selected"] = e["ticker"]
-
-with right:
-    st.subheader("Top Rises")
-    for e in rises or []:
-        with st.container(border=True):
-            st.markdown(f"**{e['ticker']}**  ${e['price']}   News {e['news_score']}/10   **Conviction {e['conviction']}/10**")
-            st.caption(e["reason"])
-            if st.button("Open", key=f"r{e['ticker']}", use_container_width=True):
-                st.session_state["selected"] = e["ticker"]
-
-if "selected" in st.session_state:
-    ticker = st.session_state["selected"]
-    data = evaluate(ticker)
-    if data:
+    for item in shorts:
+        st.markdown(f"### {item['ticker']}  ·  ${item['price']}")
+        st.markdown(f"**Conviction {item['conviction']}/10**  ·  News {item['news_score']}/10  ·  {item['reason']}")
+        st.plotly_chart(render_chart(item), use_container_width=True, key="sc"+item["ticker"])
+        st.write("**News**")
+        for n in item["news"]:
+            st.caption("• " + n.get("title", "No title"))
         st.divider()
-        st.subheader(f"{ticker}   ${data['price']}")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Price", f"${data['price']}")
-        m2.metric("VWAP", f"${data['vwap']}")
-        m3.metric("News", f"{data['news_score']}/10")
-        m4.metric("Conviction", f"{data['conviction']}/10")
-        st.write(f"**Bias:** {data['bias']}  ·  {data['reason']}")
 
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=data["hist"].index,
-            open=data["hist"]["Open"], high=data["hist"]["High"],
-            low=data["hist"]["Low"], close=data["hist"]["Close"],
-            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-            name="Price"
-        ))
-        fig.add_trace(go.Scatter(
-            x=data["hist"].index, y=data["hist"]["vwap"],
-            mode="lines", name="VWAP", line=dict(color="#ffa726", width=2)
-        ))
-        fig.update_layout(
-            template="plotly_dark", height=500,
-            xaxis_rangeslider_visible=False,
-            title=f"{ticker} · 5-minute + VWAP",
-            paper_bgcolor="#0e1117", plot_bgcolor="#161b22"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+with col2:
+    st.subheader("Top Rises")
+    for item in rises:
+        st.markdown(f"### {item['ticker']}  ·  ${item['price']}")
+        st.markdown(f"**Conviction {item['conviction']}/10**  ·  News {item['news_score']}/10  ·  {item['reason']}")
+        st.plotly_chart(render_chart(item), use_container_width=True, key="rc"+item["ticker"])
+        st.write("**News**")
+        for n in item["news"]:
+            st.caption("• " + n.get("title", "No title"))
+        st.divider()
 
-        st.subheader("News")
-        for item in data["news"]:
-            st.write(f"• {item.get('title', '')}")
-
-st.caption("Dark high-contrast layout. Refresh to update. Click Open for full view.")
+st.caption("Each card shows ticker, scores, chart with VWAP, then news. Refresh to update.")
