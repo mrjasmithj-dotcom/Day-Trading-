@@ -2,12 +2,21 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
 from datetime import datetime
 import pytz
-import requests
 
-st.set_page_config(page_title="Day Trading", layout="wide")
+st.set_page_config(page_title="Day Trading", layout="wide", initial_sidebar_state="collapsed")
+
+# Dark theme styling
+st.markdown("""
+<style>
+    .stApp { background-color: #0e1117; color: #fafafa; }
+    .stMetric { background-color: #1a1f2e; padding: 10px; border-radius: 8px; }
+    div[data-testid="stVerticalBlock"] > div { background-color: #161b22; padding: 12px; border-radius: 8px; margin-bottom: 8px; }
+    h1, h2, h3 { color: #ffffff; }
+    .stCaption { color: #8b949e; }
+</style>
+""", unsafe_allow_html=True)
 
 PT = pytz.timezone("America/Vancouver")
 
@@ -15,144 +24,118 @@ def now_pt():
     return datetime.now(PT)
 
 st.title("Day Trading")
-st.caption("Pacific Time · Multi-bot scanner · Top Shorts & Top Rises")
+st.caption(f"Pacific Time  ·  Multi-bot scanner  ·  {now_pt().strftime('%H:%M %Z')}")
 
-st.warning("""
-**Educational prototype only. Not financial advice.**  
-Free Yahoo data can lag. Leveraged/inverse products reset daily and carry decay risk.  
-Do not hold overnight. You can lose money.
-""")
+st.info("Educational prototype. Free Yahoo data can lag. Not financial advice. Leveraged products reset daily.")
 
-# Simple candidate universe for scanner
-CANDIDATES = ["CRWV", "NBIS", "IREN", "SMCI", "AMD", "NVDA", "TSLA", "AAPL", "MSFT", "META",
-              "SPY", "QQQ", "IWM", "SMH", "XLE", "XLF"]
+CANDIDATES = ["CRWV", "NBIS", "IREN", "SMCI", "AMD", "NVDA", "TSLA", "AAPL", "MSFT", "META", "SPY", "QQQ", "SMH"]
 
-def price_bot(ticker):
+@st.cache_data(ttl=45)
+def get_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1d", interval="5m", prepost=True)
         if hist.empty:
-            return None, None, None
+            return None
         hist["vwap"] = (hist["Volume"] * (hist["High"] + hist["Low"] + hist["Close"]) / 3).cumsum() / hist["Volume"].cumsum()
-        live = hist["Close"].iloc[-1]
-        vol = hist["Volume"].sum()
-        avg_vol = stock.info.get("averageVolume", vol) or vol
-        rvol = vol / avg_vol if avg_vol else 1.0
-        return hist, live, rvol
-    except:
-        return None, None, None
-
-def news_bot(ticker):
-    try:
-        stock = yf.Ticker(ticker)
+        price = round(float(hist["Close"].iloc[-1]), 2)
+        vwap = round(float(hist["vwap"].iloc[-1]), 2)
+        avg_vol = stock.info.get("averageVolume") or hist["Volume"].sum()
+        rvol = round(hist["Volume"].sum() / avg_vol, 1) if avg_vol else 1.0
         news = stock.news or []
-        catalysts = [n for n in news if any(k in n.get("title", "").lower() for k in ["contract", "deal", "terminate", "upgrade", "downgrade", "beat", "miss"])]
-        return news[:5], catalysts
+        return {"hist": hist, "price": price, "vwap": vwap, "rvol": rvol, "news": news[:3]}
     except:
-        return [], []
+        return None
 
-def peer_bot(ticker):
-    # Simplified peer check
-    return {"relative": "In-line", "basket": "Mixed"}
-
-def gex_bot(ticker):
-    return {"regime": "neutral", "call_wall": None, "put_wall": None}
-
-def scenario_group(live_price, vwap, rvol, gex, news_titles, catalysts, peer_info, ticker):
-    scenarios = []
-    if live_price and vwap:
-        if live_price > vwap and rvol and rvol > 1.5 and catalysts:
-            scenarios.append(("Hot / Up", 75, "Above VWAP + volume + catalyst"))
-        elif live_price < vwap and rvol and rvol > 1.5:
-            scenarios.append(("Down", 70, "Below VWAP + volume"))
-        else:
-            scenarios.append(("Chop", 50, "Near VWAP or mixed signals"))
+def evaluate(ticker):
+    d = get_data(ticker)
+    if not d:
+        return None
+    price, vwap, rvol = d["price"], d["vwap"], d["rvol"]
+    news_score = min(10, 5 + len(d["news"]))
+    if price < vwap and rvol > 1.3:
+        bias = "Short"
+        conviction = min(10, int(6 + rvol))
+        reason = f"Below VWAP · elevated volume ({rvol}x)"
+    elif price > vwap and rvol > 1.3:
+        bias = "Rise"
+        conviction = min(10, int(6 + rvol))
+        reason = f"Above VWAP · elevated volume ({rvol}x)"
     else:
-        scenarios.append(("Chop", 45, "Limited data"))
-    return scenarios
+        bias = "Neutral"
+        conviction = 5
+        reason = "Near VWAP or low volume"
+    return {**d, "ticker": ticker, "bias": bias, "news_score": news_score, "conviction": conviction, "reason": reason}
 
-def master_consensus(scenarios):
-    if not scenarios:
-        return "Chop / Neutral", 40, "No clear signal"
-    best = max(scenarios, key=lambda x: x[1])
-    avg = np.mean([s[1] for s in scenarios])
-    confidence = min(90, max(40, best[1] - avg + 50))
-    grade = best[0]
-    if best[1] < 45:
-        grade = "Chop / Neutral"
-    return grade, confidence, best[2]
+# Search
+col_search, _ = st.columns([1, 3])
+with col_search:
+    search = st.text_input("Search ticker", placeholder="e.g. CRWV").upper()
+    if st.button("Scan", use_container_width=True) and search:
+        st.session_state["selected"] = search
 
-def score_out_of_10(grade, conf):
-    if "Hot" in grade or "Up" in grade:
-        return min(10, int(conf / 10))
-    if "Down" in grade:
-        return min(10, int(conf / 10))
-    return 5
+with st.spinner("Updating lists..."):
+    evaluated = [evaluate(t) for t in CANDIDATES]
+    evaluated = [e for e in evaluated if e]
 
-# Sidebar / Search
-st.sidebar.header("Ticker Search")
-search_ticker = st.sidebar.text_input("Enter ticker", "").upper()
-if st.sidebar.button("Scan Ticker") and search_ticker:
-    st.session_state["selected"] = search_ticker
+shorts = sorted([e for e in evaluated if e["bias"] == "Short"], key=lambda x: x["conviction"], reverse=True)[:5]
+rises = sorted([e for e in evaluated if e["bias"] == "Rise"], key=lambda x: x["conviction"], reverse=True)[:5]
 
-# Auto-scan lists (simplified stable ranking)
-st.header("Top Shorts")
-shorts = []
-for t in CANDIDATES:
-    hist, price, rvol = price_bot(t)
-    if price:
-        _, conf, reason = master_consensus(scenario_group(price, hist["vwap"].iloc[-1] if hist is not None else None, rvol, {}, [], [], {}, t))
-        if "Down" in reason or (hist is not None and price < hist["vwap"].iloc[-1]):
-            shorts.append((t, score_out_of_10("Down", conf), reason))
-shorts = sorted(shorts, key=lambda x: x[1], reverse=True)[:5]
+left, right = st.columns(2)
 
-for t, score, reason in shorts:
-    if st.button(f"{t}  ·  Conviction {score}/10", key=f"short_{t}"):
-        st.session_state["selected"] = t
+with left:
+    st.subheader("Top Shorts")
+    for e in shorts or []:
+        with st.container(border=True):
+            st.markdown(f"**{e['ticker']}**  ${e['price']}   News {e['news_score']}/10   **Conviction {e['conviction']}/10**")
+            st.caption(e["reason"])
+            if st.button("Open", key=f"s{e['ticker']}", use_container_width=True):
+                st.session_state["selected"] = e["ticker"]
 
-st.header("Top Rises")
-rises = []
-for t in CANDIDATES:
-    hist, price, rvol = price_bot(t)
-    if price:
-        grade, conf, reason = master_consensus(scenario_group(price, hist["vwap"].iloc[-1] if hist is not None else None, rvol, {}, [], [], {}, t))
-        if "Hot" in grade or "Up" in grade:
-            rises.append((t, score_out_of_10(grade, conf), reason))
-rises = sorted(rises, key=lambda x: x[1], reverse=True)[:5]
+with right:
+    st.subheader("Top Rises")
+    for e in rises or []:
+        with st.container(border=True):
+            st.markdown(f"**{e['ticker']}**  ${e['price']}   News {e['news_score']}/10   **Conviction {e['conviction']}/10**")
+            st.caption(e["reason"])
+            if st.button("Open", key=f"r{e['ticker']}", use_container_width=True):
+                st.session_state["selected"] = e["ticker"]
 
-for t, score, reason in rises:
-    if st.button(f"{t}  ·  Conviction {score}/10", key=f"rise_{t}"):
-        st.session_state["selected"] = t
-
-# Detail view
 if "selected" in st.session_state:
     ticker = st.session_state["selected"]
-    st.divider()
-    st.subheader(f"{ticker} Detail")
-    hist, live_price, rvol = price_bot(ticker)
-    news, catalysts = news_bot(ticker)
-    vwap = hist["vwap"].iloc[-1] if hist is not None and not hist.empty else None
-    scenarios = scenario_group(live_price, vwap, rvol, {}, [n.get("title","") for n in news], catalysts, {}, ticker)
-    grade, conf, reason = master_consensus(scenarios)
-    news_score = min(10, len(catalysts)*3 + 4)
-    conv_score = score_out_of_10(grade, conf)
+    data = evaluate(ticker)
+    if data:
+        st.divider()
+        st.subheader(f"{ticker}   ${data['price']}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Price", f"${data['price']}")
+        m2.metric("VWAP", f"${data['vwap']}")
+        m3.metric("News", f"{data['news_score']}/10")
+        m4.metric("Conviction", f"{data['conviction']}/10")
+        st.write(f"**Bias:** {data['bias']}  ·  {data['reason']}")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Live Price", f"${live_price:.2f}" if live_price else "N/A")
-    col2.metric("News Score", f"{news_score}/10")
-    col3.metric("Conviction", f"{conv_score}/10")
-    st.write(f"**Grade:** {grade}")
-    st.write(f"**Reason:** {reason}")
-
-    if hist is not None and not hist.empty:
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=hist.index, open=hist["Open"], high=hist["High"], low=hist["Low"], close=hist["Close"], name="Price"))
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["vwap"], mode="lines", name="VWAP", line=dict(color="orange")))
-        fig.update_layout(title=f"{ticker} 5m Candles + VWAP", xaxis_rangeslider_visible=False, height=500)
+        fig.add_trace(go.Candlestick(
+            x=data["hist"].index,
+            open=data["hist"]["Open"], high=data["hist"]["High"],
+            low=data["hist"]["Low"], close=data["hist"]["Close"],
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+            name="Price"
+        ))
+        fig.add_trace(go.Scatter(
+            x=data["hist"].index, y=data["hist"]["vwap"],
+            mode="lines", name="VWAP", line=dict(color="#ffa726", width=2)
+        ))
+        fig.update_layout(
+            template="plotly_dark", height=500,
+            xaxis_rangeslider_visible=False,
+            title=f"{ticker} · 5-minute + VWAP",
+            paper_bgcolor="#0e1117", plot_bgcolor="#161b22"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-    st.write("**Latest Headlines:**")
-    for n in news:
-        st.write(f"- {n.get('title', 'No title')}")
+        st.subheader("News")
+        for item in data["news"]:
+            st.write(f"• {item.get('title', '')}")
 
-st.caption(f"Last update: {now_pt().strftime('%Y-%m-%d %H:%M %Z')}")
+st.caption("Dark high-contrast layout. Refresh to update. Click Open for full view.")
